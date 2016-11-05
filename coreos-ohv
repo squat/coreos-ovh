@@ -1,0 +1,109 @@
+#!/bin/sh
+
+chooseChannel() {
+    printf "Available channels:\nstable\nbeta\nalpha\nSelect desired channel: "
+    read -r channel
+    [ "$channel" != "stable" ] && [ "$channel" != "beta" ] && [ "$channel" != "alpha" ] && printf "%s is not a valid channel.\n" "$channel\n " && chooseChannel
+    printf "\n"
+}
+
+findDevices() {
+    printf "Available devices: \n"
+    # Find all disk devices
+    lsblk --output=KNAME,TYPE,MOUNTPOINT | grep disk | awk '{print $1}' | while read -r d ; do
+        # If this device does not include the currently mounted root partition, print it.
+        lsblk --output=KNAME,TYPE,MOUNTPOINT | grep "$d" | awk '{print $3}' | sed '/^\s*$/d' | grep -qv /$ && printf "/dev/%s\n" "$d"
+    done
+}
+
+chooseDevice() {
+    findDevices
+    printf "Select desired device for installation: "
+    read -r device
+    device="$(echo "$device" | sed 's/\/dev\///')"
+    validateDevice "$device" && printf "%s is not a valid device.\n" "$device" && chooseDevice
+    printf "\n"
+}
+
+validateDevice() {
+    # If the given device does not show up in the list or does show up but not as type "disk" then it is not a valid disk.
+    lsblk --output=KNAME,TYPE,MOUNTPOINT | grep "$1\s" | awk '{print $2}' | grep -q disk && return 1
+    return 0
+}
+
+unmountDevice() {
+    # Unmount all the mountpoints whose device matches the one given.
+    lsblk --output=KNAME,TYPE,MOUNTPOINT | grep "$1" | awk '{print $3}' | sed '/^\s*$/d' | while read -r m ; do
+        umount "$m"
+    done
+}
+
+inputSSHKey() {
+    printf "SSH key: "
+    read -r sshKey
+    printf "\n"
+}
+
+inputHostname() {
+    printf "Hostname: "
+    read -r hostname
+    printf "\n"
+}
+
+inputEtcdClusterSize() {
+    printf "etcd cluster size: "
+    read -r etcdSize
+    discovery="$(curl https://discovery.etcd.io/new?size="$etcdSize" 2>/dev/null)"
+    printf "\n"
+}
+
+findIPAddress() {
+    ipAddress="$(ip addr show dev eth0 | grep "inet\s" | awk '{print $4}')"
+}
+
+# Collect necessary information
+inputHostname
+inputSSHKey
+inputEtcdClusterSize
+chooseChannel
+chooseDevice
+findIPAddress
+
+# Begin installation process
+echo "Beginning CoreOS installation on /dev/$device...\n"
+unmountDevice "$device"
+cd /tmp || exit 1
+curl -O https://raw.githubusercontent.com/coreos/init/master/bin/coreos-install 2>/dev/null
+chmod +x coreos-install
+apt-get update
+apt-get install bzip2 gawk -y
+cat << EOF > cloud-config.yaml
+#cloud-config
+hostname: $hostname
+users:
+  - name: core
+    groups:
+      - sudo
+      - docker
+
+coreos:
+  etcd2:
+    discovery: $discovery
+    listen-client-urls: http://127.0.0.1:2379
+    listen-peer-urls: http://127.0.0.1:2380
+  units:
+    - name: etcd2.service
+      command: start
+    - name: fleet.service
+      command: start
+ 
+write_files:
+  - path: /etc/environment
+    permissions: 0644
+    content: |
+      PUBLIC_IPV4=$ipAddress
+ 
+ssh_authorized_keys:
+  - $sshKey
+EOF
+./coreos-install -d "/dev/$device" -c ./cloud-config.yaml -C "$channel"
