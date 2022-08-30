@@ -1,0 +1,79 @@
+#!/bin/bash
+
+findDevices() {
+    printf "Available devices: \n"
+    # Find all disk devices
+    lsblk --output=KNAME,TYPE,MOUNTPOINT | grep disk | awk '{print $1}' | while read -r d ; do
+        # If this device does not include the currently mounted root partition, print it.
+        lsblk --output=KNAME,TYPE,MOUNTPOINT | grep "$d" | awk '{print $3}' | sed '/^\s*$/d' | grep -qv /$ && printf "/dev/%s\n" "$d"
+    done
+}
+
+chooseDevice() {
+    findDevices
+    printf "Select desired device for installation: "
+    read -r device
+    device="$(echo "$device" | sed 's/\/dev\///')"
+    validateDevice "$device" && printf "%s is not a valid device.\n" "$device" && chooseDevice
+    printf "\n"
+}
+
+validateDevice() {
+    # If the given device does not show up in the list or does show up but not as type "disk" then it is not a valid disk.
+    lsblk --output=KNAME,TYPE,MOUNTPOINT | grep "$1\s" | awk '{print $2}' | grep -q disk && return 1
+    return 0
+}
+
+unmountDevice() {
+    # Unmount all the mountpoints whose device matches the one given.
+    lsblk --output=KNAME,TYPE,MOUNTPOINT | grep "$1" | awk '{print $3}' | sed '/^\s*$/d' | while read -r m ; do
+        umount "$m"
+    done
+}
+
+inputSSHKey() {
+    printf "SSH key: "
+    read -r sshKey
+    printf "\n"
+}
+
+composeIgnition() {
+    cat << EOF > fcos.ign
+{
+  "ignition": {
+    "version": "3.1.0"
+  },
+  "passwd": {
+    "users": [
+      {
+        "name": "core",
+        "sshAuthorizedKeys": [
+          "$sshKey"
+        ]
+      }
+    ]
+  }
+}
+EOF
+}
+
+updateRescue() {
+    apt-get update
+    apt-get upgrade -y
+    apt-get -y install docker.io
+    # Make room
+    apt-get autoremove -y
+    rm -rf /var/cache/apt/archives/*
+}
+
+# Collect necessary information
+inputSSHKey
+chooseDevice
+findIPAddress
+
+# Begin installation process
+updateRescue
+composeIgnition
+unmountDevice "$device"
+cd /tmp || exit 1
+docker run --privileged --rm -v /dev:/dev -v /run/udev:/run/udev -v /root:/data -w /data quay.io/coreos/coreos-installer:release install /dev/$device -i fcos.ign
